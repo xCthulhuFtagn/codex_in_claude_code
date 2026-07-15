@@ -1,1 +1,1 @@
-litellm-fork/
+# LiteLLM is vendored in litellm-fork; its own .gitignore covers local artifacts.

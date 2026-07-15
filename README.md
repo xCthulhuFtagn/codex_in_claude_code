@@ -34,110 +34,19 @@ Claude Code -> Anthropic Messages API -> LiteLLM (наш патч) -> ChatGPT/Co
 
 На issue-трекере LiteLLM на попытки починить баг №1 было несколько PR (`#21493`, `#22967`, `#22968`, `#23511`, `#23698`, `#24997`) — все закрыты как abandoned/not-planned; смержен только `#21192`, но он не покрывает именно list-формат system в этом файле. Для бага №2 есть открытый, но не смерженный PR `#31332` (родственный issue `#25429`). Если однажды один из этих PR смержат в релиз — патч ниже, скорее всего, станет не нужен; перед обновлением LiteLLM стоит попробовать сначала заводской пакет и повторить проверку из раздела «Обязательная проверка tool calls».
 
-## 1. Собрать патченую версию LiteLLM
+## 1. Установить включённую патченую версию LiteLLM
 
-Клонируем LiteLLM на зафиксированном подписанном теге в поддиректорию рядом с этим README, чтобы обновление адаптера не сломало tool calls или streaming неожиданно:
+Репозиторий уже содержит `litellm-fork/` как обычный каталог исходников — это не submodule и не вложенный Git-репозиторий. Snapshot взят из подписанного релиза LiteLLM `v1.91.1` (upstream commit `cdc8c7242bb17785a6efbf2f6c22f917ea1871f0`) и включает локальный патч из бывшего commit `bd444483612f804ff4e35827dedf626608e040ef`:
+
+- `litellm-fork/litellm/completion_extras/litellm_responses_transformation/transformation.py` переносит list-format system content в `instructions`;
+- `litellm-fork/litellm/responses/streaming_iterator.py` накапливает output-события и восстанавливает пустой финальный `output`.
+
+Перед будущим обновлением сверяйте новый тег с подписанным GitHub release, обновляйте vendored snapshot отдельным коммитом и повторно переносите или удаляйте патч только после smoke test. Не устанавливайте скомпрометированные версии `1.82.7` и `1.82.8`. Если одна из них когда-либо запускалась, переустановки недостаточно: необходимо ротировать все секреты, доступные тому процессу.
+
+Установить включённые исходники из корня этого репозитория:
 
 ```bash
 cd "$(dirname "$0" 2>/dev/null || pwd)"   # каталог с этим README
-git clone --branch v1.91.1 --depth 1 https://github.com/BerriAI/litellm.git litellm-fork
-cd litellm-fork
-git switch -c fix-chatgpt-claude-code
-```
-
-Перед будущим обновлением сверяйте номер тега с подписанным GitHub release. Не устанавливайте скомпрометированные версии `1.82.7` и `1.82.8`. Если одна из них когда-либо запускалась, переустановки недостаточно: необходимо ротировать все секреты, доступные тому процессу.
-
-В `litellm-fork/litellm/completion_extras/litellm_responses_transformation/transformation.py` найдите в функции `convert_chat_completion_messages_to_responses_api` блок:
-
-```python
-            if role == "system":
-                # Extract system message as instructions
-                if isinstance(content, str):
-                    if instructions:
-                        # Concatenate multiple system prompts with a space
-                        instructions = f"{instructions} {content}"
-                    else:
-                        instructions = content
-                else:
-                    input_items.append(
-                        {
-                            "type": "message",
-                            "role": role,
-                            "content": self._convert_content_to_responses_format(
-                                content,  # type: ignore[arg-type]
-                                role,  # type: ignore
-                            ),
-                        }
-                    )
-```
-
-и вставьте перед последним `else` новую ветку для list-формата:
-
-```python
-                elif isinstance(content, list):
-                    # List-format system content (e.g. Claude Code's cache-controlled
-                    # content blocks) must also be merged into instructions instead of
-                    # kept as a role=system input item: backends like ChatGPT/Codex
-                    # reject role=system items inside "input".
-                    text_parts = [
-                        block.get("text", "")
-                        for block in content
-                        if isinstance(block, dict) and block.get("type") in ("text", "input_text")
-                    ]
-                    system_text = "\n".join(filter(None, text_parts))
-                    if system_text:
-                        instructions = f"{instructions} {system_text}" if instructions else system_text
-```
-
-В `litellm-fork/litellm/responses/streaming_iterator.py` внесите три правки:
-
-```python
-# 1. Импорт (рядом с "from litellm.responses.utils import ResponsesAPIRequestUtils"):
-from litellm.responses.sse_output_recovery import (
-    record_output_item_chunk,
-    record_output_text_chunk,
-)
-
-# 2. В BaseResponsesAPIStreamingIterator.__init__, после self._stream_created_time = time.time():
-self._streamed_output_items: Dict[int, Dict[str, Any]] = {}
-self._streamed_text_only_items: Dict[int, Dict[str, Any]] = {}
-
-# 3. В _process_chunk, сразу после строки
-#    "openai_responses_api_chunk = self.responses_api_provider_config.transform_streaming_response(...)":
-_raw_event_type = parsed_chunk.get("type")
-if _raw_event_type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE.value:
-    record_output_item_chunk(
-        parsed_chunk=parsed_chunk,
-        output_items=self._streamed_output_items,
-    )
-elif _raw_event_type == ResponsesAPIStreamEvents.OUTPUT_TEXT_DONE.value:
-    record_output_text_chunk(
-        parsed_chunk=parsed_chunk,
-        output_items=self._streamed_output_items,
-        text_only_items=self._streamed_text_only_items,
-    )
-```
-
-И там же, перед строкой `self.completed_response = openai_responses_api_chunk` (внутри блока, который проверяет `_chunk_type in (RESPONSE_COMPLETED, RESPONSE_INCOMPLETE, RESPONSE_FAILED)`), добавьте backfill пустого `output`:
-
-```python
-if _chunk_type != openai_types.ResponsesAPIStreamEvents.RESPONSE_FAILED:
-    response_obj_for_backfill: Optional[Any] = getattr(openai_responses_api_chunk, "response", None)
-    if response_obj_for_backfill is not None and not getattr(response_obj_for_backfill, "output", None):
-        merged_items = {
-            **self._streamed_text_only_items,
-            **self._streamed_output_items,
-        }
-        if merged_items:
-            response_obj_for_backfill.output = [
-                item for _, item in sorted(merged_items.items())
-            ]
-```
-
-Собрать и установить патченую версию:
-
-```bash
-cd ..   # обратно в каталог с этим README
 uv tool install --force './litellm-fork[proxy]'
 litellm --version   # покажет 1.91.1 — это версия из pyproject, не признак отсутствия патча
 ```
@@ -486,7 +395,7 @@ unset NO_PROXY no_proxy
 uv tool uninstall litellm
 ```
 
-Каталог `litellm-fork` при этом не трогается; удалите его вручную (`rm -rf litellm-fork`), если он больше не нужен, либо оставьте — тогда `uv tool install --force './litellm-fork[proxy]'` снова поднимет патченую версию без повторного клонирования.
+Каталог `litellm-fork` при этом не трогается: это отслеживаемая Git часть данного репозитория. Не удаляйте его вручную; команда `uv tool install --force './litellm-fork[proxy]'` повторно установит патченую версию из сохранённого snapshot.
 
 Удаление `CHATGPT_TOKEN_DIR` разлогинит только LiteLLM. Перед удалением убедитесь, что путь указывает именно на отдельный каталог LiteLLM, а не на `~/.codex`; не копируйте вручную OAuth-токены из `~/.codex` или браузера.
 
