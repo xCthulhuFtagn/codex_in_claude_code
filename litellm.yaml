@@ -1,0 +1,9 @@
+model_list:
+  - model_name: openai-coder
+    model_info:
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-5.6-sol
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
