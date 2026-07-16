@@ -4,6 +4,21 @@ model_list:
       mode: responses
     litellm_params:
       model: chatgpt/gpt-5.6-sol
+  - model_name: openai-sol
+    model_info:
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-5.6-sol
+  - model_name: openai-terra
+    model_info:
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-5.5
+  - model_name: openai-luna
+    model_info:
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-5.5
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
